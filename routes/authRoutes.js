@@ -5,10 +5,9 @@ const jwt = require("jsonwebtoken");
 
 const router = express.Router();
 
-// ------------------ AUTH (Login or Register) ------------------
 router.post("/auth", async (req, res) => {
   try {
-    const { name, email, password } = req.body;
+    const { email, password } = req.body;
 
     // Validation
     if (!email || !password) {
@@ -16,48 +15,38 @@ router.post("/auth", async (req, res) => {
     }
 
     // Check if user exists
-    let user = await User.findOne({ email });
+    const user = await User.findOne({ email });
 
-    if (user) {
-      // ✅ User exists → LOGIN
-      const matchPass = await bcrypt.compare(password, user.password);
-      if (!matchPass) {
-        return res.status(400).json({ success: false, message: "Invalid credentials" });
-      }
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User does not exist" });
+    }
 
-    } else {
-      // ✅ User does not exist → REGISTER
-      if (!name) {
-        return res.status(400).json({ success: false, message: "Name is required for registration" });
-      }
+    // Compare Password
+    const matchPass = await bcrypt.compare(password, user.password);
+    if (!matchPass) {
+      return res.status(400).json({ success: false, message: "Invalid password" });
+    }
 
-      const hashedPassword = await bcrypt.hash(password, 10);
-
-      user = await User.create({
-        name,
-        email,
-        password: hashedPassword,
-        role:"user"
-      });
+    // Role check: only admin allowed
+    if (user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "You are not admin" });
     }
 
     // Create JWT Token
-    const token = jwt.sign(
-      { id: user._id, email: user.email },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
-    );
+    const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, {
+      expiresIn: "7d",
+    });
 
-    return res.json({
+    return res.status(200).json({
       success: true,
-      message: "Authentication successful",
+      message: "Admin login successful",
       token,
       user: {
         _id: user._id,
         name: user.name,
         email: user.email,
-        role:user.role
-      }
+        role: user.role,
+      },
     });
 
   } catch (error) {
@@ -67,4 +56,3 @@ router.post("/auth", async (req, res) => {
 });
 
 module.exports = router;
-
