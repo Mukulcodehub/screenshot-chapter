@@ -1,4 +1,5 @@
 
+
 const express = require("express");
 const { google } = require("googleapis");
 const multer = require("multer");
@@ -49,21 +50,6 @@ const oauth2Client = new google.auth.OAuth2(
   GOOGLE_REDIRECT_URI
 );
 
-// Load stored token if exists
-function loadStoredToken() {
-  try {
-    if (fs.existsSync(TOKEN_PATH)) {
-      const token = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
-      oauth2Client.setCredentials(token);
-    
-      return true;
-    }
-  } catch (err) {
-    console.warn("⚠️ Could not load stored token:", err.message);
-  }
-  return false;
-}
-
 // Save token to file
 function saveToken(token) {
   try {
@@ -79,8 +65,31 @@ if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
   console.error("Get these from: https://console.cloud.google.com/apis/credentials");
 }
 
-// Try to load existing token
-loadStoredToken();
+async function ensureOAuthCredentials() {
+  try {
+    if (fs.existsSync(TOKEN_PATH)) {
+      const token = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
+      oauth2Client.setCredentials(token);
+
+      if (token.expiry_date && Date.now() >= token.expiry_date) {
+        const refreshed = await oauth2Client.refreshAccessToken();
+        oauth2Client.setCredentials(refreshed.credentials);
+        saveToken(refreshed.credentials);
+      }
+      return true;
+    }
+  } catch (err) {
+    console.warn("⚠️ Could not load stored token:", err.message);
+  }
+
+  const envRefreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+  if (envRefreshToken) {
+    oauth2Client.setCredentials({ refresh_token: envRefreshToken });
+    return true;
+  }
+
+  return false;
+}
 
 // =========================================================
 // 📌 VERIFY FOLDER ACCESS (Helper function)
@@ -140,24 +149,9 @@ async function uploadToDrive(buffer, fileName) {
     tempPath = path.join(__dirname, `temp_${fileName}`);
     fs.writeFileSync(tempPath, buffer);
 
-    // Check if OAuth token exists
-    if (!fs.existsSync(TOKEN_PATH)) {
+    const hasCreds = await ensureOAuthCredentials();
+    if (!hasCreds) {
       throw new Error("Google Drive not connected. Please connect your Google account first by visiting /api/drive/auth-url");
-    }
-
-    // Load and set OAuth credentials
-    try {
-      const token = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
-      oauth2Client.setCredentials(token);
-      
-      // Refresh token if expired
-      if (token.expiry_date && Date.now() >= token.expiry_date) {
-        const refreshed = await oauth2Client.refreshAccessToken();
-        oauth2Client.setCredentials(refreshed.credentials);
-        saveToken(refreshed.credentials);
-      }
-    } catch (err) {
-      throw new Error("Failed to load OAuth token. Please reconnect Google Drive: " + err.message);
     }
 
 
@@ -331,15 +325,13 @@ app.get("/api/drive/oauth2callback", async (req, res) => {
 // List accessible folders (for debugging)
 app.get("/api/drive/list-folders", async (req, res) => {
   try {
-    if (!fs.existsSync(TOKEN_PATH)) {
+    const hasCreds = await ensureOAuthCredentials();
+    if (!hasCreds) {
       return res.status(400).json({
         success: false,
         error: "Google Drive not connected. Please connect first."
       });
     }
-
-    const token = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
-    oauth2Client.setCredentials(token);
 
     const drive = google.drive({ version: "v3", auth: oauth2Client });
 
@@ -368,29 +360,39 @@ app.get("/api/drive/list-folders", async (req, res) => {
 // Check OAuth connection status
 app.get("/api/drive/status", (req, res) => {
   try {
-    const hasToken = fs.existsSync(TOKEN_PATH);
-    let isConnected = false;
+    const hasTokenFile = fs.existsSync(TOKEN_PATH);
+    const envRefreshToken = !!process.env.GOOGLE_REFRESH_TOKEN;
+    let isConnected = envRefreshToken;
     let tokenInfo = null;
 
-    if (hasToken) {
+    if (hasTokenFile) {
       try {
         const token = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
         oauth2Client.setCredentials(token);
-        isConnected = !!token.refresh_token || !!token.access_token;
+        const hasRefreshToken = !!token.refresh_token || envRefreshToken;
+        const hasAccessToken = !!token.access_token;
+        isConnected = hasRefreshToken || hasAccessToken;
         tokenInfo = {
-          hasRefreshToken: !!token.refresh_token,
-          hasAccessToken: !!token.access_token,
+          hasRefreshToken,
+          hasAccessToken,
           expiresAt: token.expiry_date ? new Date(token.expiry_date).toISOString() : null
         };
       } catch (err) {
         console.error("Error reading token:", err);
       }
+    } else if (envRefreshToken) {
+      tokenInfo = {
+        hasRefreshToken: true,
+        hasAccessToken: false,
+        expiresAt: null
+      };
     }
 
     res.json({
       success: true,
       connected: isConnected,
-      hasToken: hasToken,
+      hasTokenFile,
+      hasEnvRefreshToken: envRefreshToken,
       tokenInfo: tokenInfo,
       needsAuth: !isConnected
     });
