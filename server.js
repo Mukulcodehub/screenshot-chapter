@@ -71,17 +71,43 @@ async function loadToken() {
   }
 }
 
+// Migrate old token.json to DB (one-time migration)
+async function migrateTokenFromFile() {
+  const TOKEN_PATH = path.join(__dirname, "token.json");
+  try {
+    if (fs.existsSync(TOKEN_PATH)) {
+      const dbToken = await loadToken();
+      // Only migrate if DB doesn't have token
+      if (!dbToken) {
+        const fileToken = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
+        await saveToken(fileToken);
+        console.log("✅ Migrated token.json to database");
+        // Optionally delete old file (uncomment if you want)
+        // fs.unlinkSync(TOKEN_PATH);
+      }
+    }
+  } catch (err) {
+    console.warn("⚠️ Token migration skipped:", err.message);
+  }
+}
+
 // Check if we have valid credentials
 if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
   console.error("❌ ERROR: GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set in .env file");
   console.error("Get these from: https://console.cloud.google.com/apis/credentials");
 }
 
-// On startup, set credentials if exist in DB:
+// On startup: Migrate old token.json to DB, then load from DB
 (async () => {
+  // Wait for DB connection
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  await migrateTokenFromFile();
   const dbToken = await loadToken();
   if (dbToken) {
     oauth2Client.setCredentials(dbToken);
+    console.log("✅ Google Drive token loaded from database");
+  } else {
+    console.log("ℹ️ No Google Drive token found. Please connect via /api/drive/auth-url");
   }
 })();
 
