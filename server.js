@@ -9,6 +9,7 @@ const Screenshot = require("./ScreenshotSchema.js");
 const fs = require("fs");
 const path = require("path");
 const getServerMAC = require("./utils/getMac");
+const Token = require("./TokenModel");
 
 dotenv.config();
 const app = express();
@@ -39,9 +40,6 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || "http://localhost:5000/api/drive/oauth2callback";
 
-// Token storage file
-const TOKEN_PATH = path.join(__dirname, "token.json");
-
 // OAuth2 Client
 const oauth2Client = new google.auth.OAuth2(
   GOOGLE_CLIENT_ID,
@@ -49,27 +47,27 @@ const oauth2Client = new google.auth.OAuth2(
   GOOGLE_REDIRECT_URI
 );
 
-// Load stored token if exists
-function loadStoredToken() {
+// Async DB: Save token
+async function saveToken(token) {
   try {
-    if (fs.existsSync(TOKEN_PATH)) {
-      const token = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
-      oauth2Client.setCredentials(token);
-    
-      return true;
-    }
+    await Token.findOneAndUpdate(
+      { key: "google_oauth_token" },
+      { value: token },
+      { upsert: true, new: true }
+    );
   } catch (err) {
-    console.warn("⚠️ Could not load stored token:", err.message);
+    console.error("❌ Failed to save token to DB:", err.message);
   }
-  return false;
 }
 
-// Save token to file
-function saveToken(token) {
+// Async DB: Load token
+async function loadToken() {
   try {
-    fs.writeFileSync(TOKEN_PATH, JSON.stringify(token, null, 2));
+    const t = await Token.findOne({ key: "google_oauth_token" });
+    return t ? t.value : null;
   } catch (err) {
-    console.error("❌ Failed to save token:", err.message);
+    console.warn("⚠️ Could not load stored token from DB:", err.message);
+    return null;
   }
 }
 
@@ -79,8 +77,13 @@ if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
   console.error("Get these from: https://console.cloud.google.com/apis/credentials");
 }
 
-// Try to load existing token
-loadStoredToken();
+// On startup, set credentials if exist in DB:
+(async () => {
+  const dbToken = await loadToken();
+  if (dbToken) {
+    oauth2Client.setCredentials(dbToken);
+  }
+})();
 
 // =========================================================
 // 📌 VERIFY FOLDER ACCESS (Helper function)
@@ -140,24 +143,17 @@ async function uploadToDrive(buffer, fileName) {
     tempPath = path.join(__dirname, `temp_${fileName}`);
     fs.writeFileSync(tempPath, buffer);
 
-    // Check if OAuth token exists
-    if (!fs.existsSync(TOKEN_PATH)) {
+    // Load OAuth token from DB
+    const token = await loadToken();
+    if (!token) {
       throw new Error("Google Drive not connected. Please connect your Google account first by visiting /api/drive/auth-url");
     }
-
-    // Load and set OAuth credentials
-    try {
-      const token = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
-      oauth2Client.setCredentials(token);
-      
-      // Refresh token if expired
-      if (token.expiry_date && Date.now() >= token.expiry_date) {
-        const refreshed = await oauth2Client.refreshAccessToken();
-        oauth2Client.setCredentials(refreshed.credentials);
-        saveToken(refreshed.credentials);
-      }
-    } catch (err) {
-      throw new Error("Failed to load OAuth token. Please reconnect Google Drive: " + err.message);
+    oauth2Client.setCredentials(token);
+    // Refresh token if expired
+    if (token.expiry_date && Date.now() >= token.expiry_date) {
+      const refreshed = await oauth2Client.refreshAccessToken();
+      oauth2Client.setCredentials(refreshed.credentials);
+      await saveToken(refreshed.credentials);
     }
 
 
@@ -296,8 +292,8 @@ app.get("/api/drive/oauth2callback", async (req, res) => {
     const { tokens } = await oauth2Client.getToken(code);
     oauth2Client.setCredentials(tokens);
 
-    // Save tokens for future use
-    saveToken(tokens);
+    // Save DB token instead of file
+    await saveToken(tokens);
 
     // Send success response
     res.send(`
@@ -331,14 +327,14 @@ app.get("/api/drive/oauth2callback", async (req, res) => {
 // List accessible folders (for debugging)
 app.get("/api/drive/list-folders", async (req, res) => {
   try {
-    if (!fs.existsSync(TOKEN_PATH)) {
+    const token = await loadToken();
+    if (!token) {
       return res.status(400).json({
         success: false,
         error: "Google Drive not connected. Please connect first."
       });
     }
 
-    const token = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
     oauth2Client.setCredentials(token);
 
     const drive = google.drive({ version: "v3", auth: oauth2Client });
@@ -366,31 +362,25 @@ app.get("/api/drive/list-folders", async (req, res) => {
 });
 
 // Check OAuth connection status
-app.get("/api/drive/status", (req, res) => {
+app.get("/api/drive/status", async (req, res) => {
   try {
-    const hasToken = fs.existsSync(TOKEN_PATH);
-    let isConnected = false;
-    let tokenInfo = null;
+    const token = await loadToken();
+    let isConnected = false, tokenInfo = null;
 
-    if (hasToken) {
-      try {
-        const token = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
-        oauth2Client.setCredentials(token);
-        isConnected = !!token.refresh_token || !!token.access_token;
-        tokenInfo = {
-          hasRefreshToken: !!token.refresh_token,
-          hasAccessToken: !!token.access_token,
-          expiresAt: token.expiry_date ? new Date(token.expiry_date).toISOString() : null
-        };
-      } catch (err) {
-        console.error("Error reading token:", err);
-      }
+    if (token) {
+      oauth2Client.setCredentials(token);
+      isConnected = !!token.refresh_token || !!token.access_token;
+      tokenInfo = {
+        hasRefreshToken: !!token.refresh_token,
+        hasAccessToken: !!token.access_token,
+        expiresAt: token.expiry_date ? new Date(token.expiry_date).toISOString() : null
+      };
     }
 
     res.json({
       success: true,
       connected: isConnected,
-      hasToken: hasToken,
+      hasToken: !!token,
       tokenInfo: tokenInfo,
       needsAuth: !isConnected
     });
