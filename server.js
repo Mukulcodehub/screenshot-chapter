@@ -27,7 +27,8 @@ app.use(
 // Connect DB
 connectDB();
 app.use("/api/auth", require("./routes/authRoutes.js"));
-
+app.use("/update", require("./updateroutes/updateroutes.js"));
+app.use("/clear", require("./clearmac/clearmacroutes.js"));
 // Multer Memory Storage
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -458,6 +459,7 @@ const screenshot = await Screenshot.create({
   driveFileId: uploaded.id,
   driveURL: uploaded.url,
   serverMac: serverMac,
+  macname:null,
   createdAt: new Date(),
 });
 
