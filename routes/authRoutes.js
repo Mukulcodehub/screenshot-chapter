@@ -9,7 +9,7 @@ router.post("/auth", async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    // Validation
+    // --Validation
     if (!email || !password) {
       return res.status(400).json({ success: false, message: "Email & Password required" });
     }
