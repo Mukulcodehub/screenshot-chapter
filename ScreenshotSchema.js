@@ -10,7 +10,7 @@ const mongoose = require("mongoose");
 //   }
 // });
 const ScreenshotSchema = new mongoose.Schema({
-  userId: String,
+   deviceUUID: { type: String, required: true },
   fileName: String,
   deviceInfo: Object,
   driveURL: String,

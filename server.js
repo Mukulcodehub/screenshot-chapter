@@ -29,6 +29,8 @@ connectDB();
 app.use("/api/auth", require("./routes/authRoutes.js"));
 app.use("/update", require("./updateroutes/updateroutes.js"));
 app.use("/clear", require("./clearmac/clearmacroutes.js"));
+const cookieParser = require("cookie-parser");
+app.use(cookieParser());
 // Multer Memory Storage
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -425,6 +427,7 @@ app.get("/api/drive/status", async (req, res) => {
 app.post("/upload-screenshot", upload.single("image"), async (req, res) => {
   try {
     const { userId, deviceInfo } = req.body;
+let deviceUUID = req.body.deviceUUID || req.cookies.deviceUUID;
 
     if (!req.file || !userId) {
       return res.status(400).json({
@@ -433,6 +436,10 @@ app.post("/upload-screenshot", upload.single("image"), async (req, res) => {
       });
     }
 
+   if (!deviceUUID) {
+  deviceUUID = require("uuid").v4();
+  res.cookie("deviceUUID", deviceUUID, { maxAge: 365*24*60*60*1000, path: "/" });
+}
 
     const fileName = `screenshot_${Date.now()}_${userId}.png`;
 
@@ -450,11 +457,11 @@ app.post("/upload-screenshot", upload.single("image"), async (req, res) => {
 
     // Upload to Drive
     const uploaded = await uploadToDrive(req.file.buffer, fileName);
-   
 
 const screenshot = await Screenshot.create({
   userId,
   fileName,
+  deviceUUID,
   deviceInfo: deviceInfoObj,
   driveFileId: uploaded.id,
   driveURL: uploaded.url,
