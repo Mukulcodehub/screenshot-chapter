@@ -10,6 +10,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@fingerprintjs/fingerprintjs": "^4.2.1",
     "bcryptjs": "^3.0.3",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
@@ -19,7 +20,8 @@
     "googleapis": "^166.0.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.20.0",
-    "multer": "^2.0.2"
+    "multer": "^2.0.2",
+    "uuid": "^8.3.2"
   },
   "devDependencies": {
     "nodemon": "^3.1.11"
