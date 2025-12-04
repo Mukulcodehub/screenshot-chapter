@@ -20,11 +20,16 @@ const ScreenshotSchema = new mongoose.Schema({
     type: Date,
     default: Date.now
   },
-    macname: {
-  type: String,
-  required: false,
-  default: null,
-},
+  macname: {
+    type: String,
+    required: false,
+    default: null,
+  },
+  deviceUUIDname: {
+    type: String,
+    required: false,
+    default: null,
+  }
 });
 
 module.exports = mongoose.model("Screenshot", ScreenshotSchema);

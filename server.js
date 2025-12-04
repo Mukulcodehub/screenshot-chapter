@@ -34,6 +34,8 @@ app.use(cookieParser());
 // Connect DB
 connectDB();
 app.use("/api/auth", require("./routes/authRoutes.js"));
+app.use("/Deviceupdate",require("./deviceuuidroute/Deviceuuidroute.js"))
+app.use("/Deviceclear",require("./deviceclearuuidroute/deviceclearuuidroute.js"))
 app.use("/update", require("./updateroutes/updateroutes.js"));
 app.use("/clear", require("./clearmac/clearmacroutes.js"));
 
