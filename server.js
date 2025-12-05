@@ -1,5 +1,3 @@
-
-
 const express = require("express");
 const { google } = require("googleapis");
 const multer = require("multer");
@@ -12,7 +10,8 @@ const path = require("path");
 const getServerMAC = require("./utils/getMac");
 const Token = require("./TokenModel");
 const cookieParser = require("cookie-parser");
-const Device = require("./DeviceSchema.js"); // Device model
+const Device = require("./DeviceSchema.js");
+const crypto = require("crypto");
 
 dotenv.config();
 const app = express();
@@ -22,7 +21,7 @@ app.use(express.json({ limit: "20mb" }));
 app.use(
   cors({
     origin: [
-      "https://screen-shot-new.vercel.app",
+      "https://extensions-screen.vercel.app",'https://screen-shot-new.vercel.app',
       "http://localhost:3000",
     ],
     methods: ["GET", "POST"],
@@ -34,8 +33,8 @@ app.use(cookieParser());
 // Connect DB
 connectDB();
 app.use("/api/auth", require("./routes/authRoutes.js"));
-app.use("/Deviceupdate",require("./deviceuuidroute/Deviceuuidroute.js"))
-app.use("/Deviceclear",require("./deviceclearuuidroute/deviceclearuuidroute.js"))
+app.use("/Deviceupdate", require("./deviceuuidroute/Deviceuuidroute.js"));
+app.use("/Deviceclear", require("./deviceclearuuidroute/deviceclearuuidroute.js"));
 app.use("/update", require("./updateroutes/updateroutes.js"));
 app.use("/clear", require("./clearmac/clearmacroutes.js"));
 
@@ -71,7 +70,6 @@ async function saveToken(token) {
   }
 }
 
-// Async DB: Load token
 async function loadToken() {
   try {
     const t = await Token.findOne({ key: "google_oauth_token" });
@@ -82,7 +80,6 @@ async function loadToken() {
   }
 }
 
-// Migrate old token.json to DB (one-time migration)
 async function migrateTokenFromFile() {
   const TOKEN_PATH = path.join(__dirname, "token.json");
   try {
@@ -91,8 +88,6 @@ async function migrateTokenFromFile() {
       if (!dbToken) {
         const fileToken = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
         await saveToken(fileToken);
-        console.log("✅ Migrated token.json to database");
-        // fs.unlinkSync(TOKEN_PATH);
       }
     }
   } catch (err) {
@@ -142,7 +137,6 @@ async function verifyFolderAccess(folderId, drive) {
 
     if (folder.data.owners && folder.data.owners.length > 0) {
       const ownerEmail = folder.data.owners[0].emailAddress;
-      // console.log("Folder owner:", ownerEmail);
     }
 
     return true;
@@ -428,13 +422,8 @@ app.get("/api/drive/status", async (req, res) => {
 });
 
 // =========================================================
-// 📌 DEVICE MATCHING HELPERS (UPDATED)
+// 📌 CORE: DEVICE IDENTIFICATION (SAME DEVICE = SAME UUID)
 // =========================================================
-function extractBrowserVersion(userAgent) {
-  const matches = userAgent.match(/(Chrome|Firefox|Safari|Edge)\/([0-9.]+)/);
-  return matches ? `${matches[1]}/${matches[2]}` : userAgent.substring(0, 50);
-}
-
 function normalizeTimezone(tz) {
   if (!tz) return tz;
   if (tz === "Asia/Calcutta") return "Asia/Kolkata";
@@ -448,148 +437,322 @@ function normalizeIP(ip) {
   return ip;
 }
 
-function generateEnhancedFingerprint(deviceInfo, req, clientIP) {
+// Generate DEVICE-SPECIFIC fingerprint (not browser-specific)
+function generateDeviceFingerprint(deviceInfo, clientIP) {
   const normTz = normalizeTimezone(deviceInfo.timezone);
   const normIP = normalizeIP(clientIP);
 
-  const components = [
+  const deviceComponents = [
+    deviceInfo.hardwareConcurrency || "unknown",
+    deviceInfo.deviceMemory || "unknown",
+    deviceInfo.cpuThreads || "unknown",
+
     deviceInfo.screenResolution
       ? `${deviceInfo.screenResolution.width}x${deviceInfo.screenResolution.height}`
-      : "",
-    deviceInfo.cpuThreads || deviceInfo.hardwareConcurrency || "",
-    deviceInfo.deviceMemory || "",
-    normTz || "",
-    deviceInfo.language || "",
-    deviceInfo.os || deviceInfo.platform || "",
-    deviceInfo.userAgent ? extractBrowserVersion(deviceInfo.userAgent) : "",
-    normIP || clientIP,
-    deviceInfo.colorDepth || "",
-    deviceInfo.pixelDepth || "",
-    deviceInfo.maxTouchPoints || "",
+      : "unknown",
+    deviceInfo.colorDepth || "unknown",
+    deviceInfo.pixelDepth || "unknown",
+
+    deviceInfo.os || deviceInfo.platform || "unknown",
+    deviceInfo.platform || "unknown",
+
+    normIP || "unknown",
+    normTz || "unknown",
+
+    deviceInfo.language || "unknown",
+
+    deviceInfo.maxTouchPoints || "unknown",
+    deviceInfo.devicePixelRatio || "unknown",
   ];
 
-  return components.filter((val) => val && val !== "").join("|");
+  const fingerprintString = deviceComponents.join("::");
+  const hash = crypto.createHash("sha256").update(fingerprintString).digest("hex");
+
+  console.log("🖥️ Device Fingerprint Components:");
+  console.log("   Hardware Cores:", deviceInfo.hardwareConcurrency);
+  console.log(
+    "   Screen:",
+    deviceInfo.screenResolution
+      ? `${deviceInfo.screenResolution.width}x${deviceInfo.screenResolution.height}`
+      : "unknown"
+  );
+  console.log("   OS/Platform:", deviceInfo.os || deviceInfo.platform);
+  console.log("   IP:", normIP);
+  console.log("   Fingerprint Hash:", hash.substring(0, 32) + "...");
+
+  return hash;
 }
 
-async function findDeviceByMultipleCriteria({
+// =========================================================
+// 📌 FIND DEVICE BY MULTIPLE CRITERIA
+// =========================================================
+async function findDeviceByHardware({
   visitorId,
-  deviceUUID,
-  fingerprint,
+  frontendUUID,
   clientIP,
   deviceInfo,
 }) {
   try {
+    console.log("\n🔍 Searching for existing device...");
+
     const normIP = normalizeIP(clientIP);
-    const normTz = normalizeTimezone(deviceInfo.timezone);
-    const hardwareThreads =
-      deviceInfo.cpuThreads || deviceInfo.hardwareConcurrency;
-    const platform = deviceInfo.os || deviceInfo.platform || "unknown";
+    const deviceFingerprint = generateDeviceFingerprint(deviceInfo, clientIP);
 
-    // 1️⃣ Sabse pehle UUID se
-    if (deviceUUID) {
-      const byDeviceUUID = await Device.findOne({ deviceUUID });
-      if (byDeviceUUID) {
-        console.log("📍 Found device by deviceUUID (primary)");
-        return byDeviceUUID;
-      }
-    }
-
-    // 2️⃣ Phir visitorId
+    // 1. FIRST: Check by Visitor ID (FingerprintJS)
     if (visitorId) {
+      console.log("👤 Searching by Visitor ID:", visitorId);
       const byVisitorId = await Device.findOne({ visitorId });
       if (byVisitorId) {
-        console.log("📍 Found device by visitorId");
-        return byVisitorId;
+        console.log("✅ Found by Visitor ID");
+        return {
+          device: byVisitorId,
+          matchType: "visitor_id",
+          confidence: "HIGH",
+        };
       }
     }
 
-    // 3️⃣ Fingerprint
-    if (fingerprint) {
-      const byFingerprint = await Device.findOne({ fingerprint });
-      if (byFingerprint) {
-        console.log("📍 Found device by fingerprint");
-        return byFingerprint;
+    // 2. Check by frontend UUID
+    if (frontendUUID) {
+      console.log("📱 Searching by UUID:", frontendUUID);
+      const byUUID = await Device.findOne({ deviceUUID: frontendUUID });
+      if (byUUID) {
+        console.log("✅ Found by UUID");
+        return {
+          device: byUUID,
+          matchType: "uuid",
+          confidence: "HIGH",
+        };
       }
     }
 
-    // 4️⃣ IP + UserAgent
-    if (normIP && deviceInfo.userAgent) {
-      const byIPAndUA = await Device.findOne({
-        ip: { $in: [normIP, clientIP] },
-        userAgent: {
-          $regex: deviceInfo.userAgent.substring(0, 80),
-          $options: "i",
-        },
-      });
-      if (byIPAndUA) {
-        console.log("📍 Found device by IP + UserAgent");
-        return byIPAndUA;
-      }
+    // 3. Check by Device Fingerprint
+    console.log("🔑 Searching by Device Fingerprint...");
+    const byFingerprint = await Device.findOne({
+      fingerprint: deviceFingerprint,
+    });
+    if (byFingerprint) {
+      console.log("✅ Found by Device Fingerprint");
+      console.log("   Same Device, Different Browser");
+      return {
+        device: byFingerprint,
+        matchType: "device_fingerprint",
+        confidence: "HIGH",
+      };
     }
 
-    // 5️⃣ Hardware characteristics (strict)
-    if (deviceInfo.screenResolution && normTz) {
+    // 4. Check by IP + Hardware Combination
+    if (normIP && deviceInfo.hardwareConcurrency && deviceInfo.screenResolution) {
       const screenRes = `${deviceInfo.screenResolution.width}x${deviceInfo.screenResolution.height}`;
 
-      const hardwareQuery = {
+      console.log("🖥️ Searching by IP + Hardware...");
+      const byHardware = await Device.findOne({
+        $or: [{ ip: normIP }, { ip: { $regex: normIP, $options: "i" } }],
+        hardwareConcurrency: deviceInfo.hardwareConcurrency,
         screenResolution: screenRes,
-        timezone: normTz,
-      };
+      });
 
-      if (hardwareThreads) {
-        hardwareQuery.hardwareConcurrency = hardwareThreads;
-      }
-
-      const byHardware = await Device.findOne(hardwareQuery);
       if (byHardware) {
-        console.log("📍 Found device by hardware characteristics (strict)");
-        return byHardware;
+        console.log("✅ Found by IP + Hardware");
+        console.log("   Same Machine, Maybe Different Browser");
+        return {
+          device: byHardware,
+          matchType: "hardware",
+          confidence: "MEDIUM",
+        };
       }
     }
 
-    // 6️⃣ Loose hardware match (just in case)
-    if (hardwareThreads && platform !== "unknown") {
-      const looseQuery = {
-        platform: platform,
-        hardwareConcurrency: hardwareThreads,
-      };
+    // 5. Check by Screen Resolution + OS
+    if (deviceInfo.screenResolution && deviceInfo.os) {
+      const screenRes = `${deviceInfo.screenResolution.width}x${deviceInfo.screenResolution.height}`;
 
-      if (normIP === "127.0.0.1") {
-        const byLooseHardware = await Device.findOne(looseQuery);
-        if (byLooseHardware) {
-          console.log(
-            "📍 Found device by loose hardware (platform + threads, local dev)"
-          );
-          return byLooseHardware;
-        }
-      } else {
-        const byLooseHardware = await Device.findOne({
-          ...looseQuery,
-          ip: normIP,
-        });
-        if (byLooseHardware) {
-          console.log(
-            "📍 Found device by loose hardware (platform + threads + ip)"
-          );
-          return byLooseHardware;
-        }
+      console.log("🖥️ Searching by Screen + OS...");
+      const byScreenOS = await Device.findOne({
+        screenResolution: screenRes,
+        $or: [{ os: deviceInfo.os }, { platform: deviceInfo.platform }],
+      });
+
+      if (byScreenOS) {
+        console.log("✅ Found by Screen + OS");
+        return {
+          device: byScreenOS,
+          matchType: "screen_os",
+          confidence: "MEDIUM",
+        };
       }
     }
 
-    console.log("🔍 No existing device found in matcher");
+    console.log("🔍 No existing device found");
     return null;
   } catch (error) {
-    console.error("Error in device finding:", error);
+    console.error("Error finding device:", error);
     return null;
   }
 }
 
 // =========================================================
-// 📌 ROUTE: Upload Screenshot (WITH DEVICE MATCHING)
+// 📌 GET OR CREATE DEVICE UUID (SAME DEVICE = SAME UUID)
+// =========================================================
+async function getOrCreateDeviceUUID({
+  frontendUUID,
+  visitorId,
+  clientIP,
+  deviceInfo,
+}) {
+  try {
+    console.log("\n🔍 DEVICE IDENTIFICATION ===================");
+    console.log("📱 Frontend UUID:", frontendUUID || "Not provided");
+    console.log("👤 Visitor ID:", visitorId || "Not provided");
+    console.log("🌐 Client IP:", clientIP);
+    console.log("🖥️ OS:", deviceInfo.os || deviceInfo.platform || "unknown");
+    console.log(
+      "💻 Hardware Cores:",
+      deviceInfo.hardwareConcurrency || "unknown"
+    );
+    console.log(
+      "🖥️ Screen:",
+      deviceInfo.screenResolution
+        ? `${deviceInfo.screenResolution.width}x${deviceInfo.screenResolution.height}`
+        : "unknown"
+    );
+
+    const deviceFingerprint = generateDeviceFingerprint(deviceInfo, clientIP);
+
+    // Step 1: Try to find existing device
+    const foundDevice = await findDeviceByHardware({
+      visitorId,
+      frontendUUID,
+      clientIP,
+      deviceInfo,
+    });
+
+    if (foundDevice && foundDevice.device) {
+      console.log("\n✅ FOUND EXISTING DEVICE");
+      console.log("   UUID:", foundDevice.device.deviceUUID);
+      console.log("   Match Type:", foundDevice.matchType);
+      console.log("   Confidence:", foundDevice.confidence);
+      console.log(
+        "   Browser on this device:",
+        deviceInfo.browser || "unknown"
+      );
+
+      // Update device info (especially if using different browser)
+      foundDevice.device.lastSeen = new Date();
+      foundDevice.device.visitorId = visitorId || foundDevice.device.visitorId;
+
+      // ✅ FIX: IP ko hamesha STRING ke roop me hi store karna
+      let existingIpStr = "";
+
+      if (Array.isArray(foundDevice.device.ip)) {
+        // Purane galat data ko normalize karo
+        existingIpStr = foundDevice.device.ip.join(", ");
+      } else if (typeof foundDevice.device.ip === "string") {
+        existingIpStr = foundDevice.device.ip;
+      } else if (!foundDevice.device.ip) {
+        existingIpStr = "";
+      }
+
+      if (!existingIpStr) {
+        foundDevice.device.ip = clientIP;
+      } else if (!existingIpStr.includes(clientIP)) {
+        foundDevice.device.ip = `${existingIpStr}, ${clientIP}`;
+      }
+
+      // Update fingerprint
+      foundDevice.device.fingerprint = deviceFingerprint;
+
+      // Update browser info (track all browsers used on this device)
+      if (deviceInfo.browser) {
+        if (!foundDevice.device.browsers) foundDevice.device.browsers = [];
+        if (!foundDevice.device.browsers.includes(deviceInfo.browser)) {
+          foundDevice.device.browsers.push(deviceInfo.browser);
+        }
+      }
+
+      await foundDevice.device.save();
+
+      return {
+        deviceUUID: foundDevice.device.deviceUUID,
+        source: foundDevice.matchType,
+        isExisting: true,
+        deviceInfo: {
+          os: foundDevice.device.os,
+          platform: foundDevice.device.platform,
+          hardwareCores: foundDevice.device.hardwareConcurrency,
+          screen: foundDevice.device.screenResolution,
+          browsers: foundDevice.device.browsers || [],
+        },
+      };
+    }
+
+    // Step 2: NO EXISTING DEVICE FOUND - CREATE NEW ONE
+    console.log("\n🆕 NO EXISTING DEVICE FOUND - CREATING NEW");
+
+    const newUUID = frontendUUID || require("uuid").v4();
+
+    // Detect browser from userAgent
+    let browserType = "unknown";
+    const userAgent = deviceInfo.userAgent || "";
+    if (userAgent.includes("Firefox")) browserType = "firefox";
+    else if (userAgent.includes("Chrome") && !userAgent.includes("Edg"))
+      browserType = "chrome";
+    else if (userAgent.includes("Safari") && !userAgent.includes("Chrome"))
+      browserType = "safari";
+    else if (userAgent.includes("Edg")) browserType = "edge";
+
+    console.log("✨ Creating new device with UUID:", newUUID);
+    console.log("📝 Device Fingerprint:", deviceFingerprint.substring(0, 32) + "...");
+    console.log("🌐 First Browser on this device:", browserType);
+
+    const newDevice = await Device.create({
+      deviceUUID: newUUID,
+      visitorId: visitorId,
+      fingerprint: deviceFingerprint,
+      ip: clientIP, // ✅ string
+      userAgent: deviceInfo.userAgent || "",
+      screenResolution: deviceInfo.screenResolution
+        ? `${deviceInfo.screenResolution.width}x${deviceInfo.screenResolution.height}`
+        : "",
+      timezone: deviceInfo.timezone || "",
+      language: deviceInfo.language || "",
+      hardwareConcurrency: deviceInfo.hardwareConcurrency || "",
+      os: deviceInfo.os || "",
+      platform: deviceInfo.platform || "",
+      browser: browserType,
+      browsers: [browserType],
+      lastSeen: new Date(),
+      createdAt: new Date(),
+    });
+
+    console.log("✅ New device created successfully");
+
+    return {
+      deviceUUID: newDevice.deviceUUID,
+      source: "new_device",
+      isExisting: false,
+      deviceInfo: {
+        os: newDevice.os,
+        platform: newDevice.platform,
+        hardwareCores: newDevice.hardwareConcurrency,
+        screen: newDevice.screenResolution,
+        browser: browserType,
+        browsers: newDevice.browsers || [browserType],
+      },
+    };
+  } catch (error) {
+    console.error("❌ Device identification error:", error);
+    // ❌ NO RANDOM FALLBACK UUID – let caller handle the error
+    throw error;
+  }
+}
+
+// =========================================================
+// 📌 UPLOAD SCREENSHOT ROUTE (FINAL VERSION)
 // =========================================================
 app.post("/upload-screenshot", upload.single("image"), async (req, res) => {
   try {
-    const { deviceInfo, visitorId, deviceUUID } = req.body;
+    const { deviceInfo, visitorId, deviceUUID: frontendUUID } = req.body;
 
     if (!req.file) {
       return res.status(400).json({
@@ -612,104 +775,88 @@ app.post("/upload-screenshot", upload.single("image"), async (req, res) => {
       }
     }
 
-    // normalize timezone in object
+    if (!deviceInfoObj.browser) {
+      const userAgent = deviceInfoObj.userAgent || "";
+      if (userAgent.includes("Firefox")) deviceInfoObj.browser = "firefox";
+      else if (userAgent.includes("Chrome") && !userAgent.includes("Edg"))
+        deviceInfoObj.browser = "chrome";
+      else if (userAgent.includes("Safari") && !userAgent.includes("Chrome"))
+        deviceInfoObj.browser = "safari";
+      else if (userAgent.includes("Edg")) deviceInfoObj.browser = "edge";
+      else deviceInfoObj.browser = "other";
+    }
+
     deviceInfoObj.timezone = normalizeTimezone(deviceInfoObj.timezone);
 
-    const fingerprint = generateEnhancedFingerprint(
-      deviceInfoObj,
-      req,
-      clientIP
-    );
-
-    console.log("🔍 Device Identification Debug:");
-    console.log("Visitor ID:", visitorId);
-    console.log("Device UUID from frontend:", deviceUUID);
-    console.log("Generated Fingerprint:", fingerprint.substring(0, 60) + "...");
-    console.log("IP:", clientIP);
-    console.log(
-      "User Agent:",
-      deviceInfoObj.userAgent?.substring(0, 60) + "..."
-    );
-
-    // 1) Try normal matcher
-    let deviceRecord = await findDeviceByMultipleCriteria({
+    // Step 1: Get or Create Device UUID (SAME DEVICE = SAME UUID)
+    const deviceResult = await getOrCreateDeviceUUID({
+      frontendUUID,
       visitorId,
-      deviceUUID,
-      fingerprint,
       clientIP,
       deviceInfo: deviceInfoObj,
     });
 
-    // 2) EXTRA: last-chance fallback BEFORE create → same machine by hardware
-    if (!deviceRecord) {
-      const hardwareThreads =
-        deviceInfoObj.cpuThreads || deviceInfoObj.hardwareConcurrency;
-      const platform = deviceInfoObj.os || deviceInfoObj.platform || "unknown";
+    let finalDeviceUUID = deviceResult.deviceUUID;
 
-      if (hardwareThreads && platform !== "unknown") {
-        const looseQuery = {
-          platform: platform,
-          hardwareConcurrency: hardwareThreads,
-        };
+    // ✅ EXTRA SAFETY: ensure Device doc exists for this UUID
+    let deviceDoc = await Device.findOne({ deviceUUID: finalDeviceUUID });
 
-        console.log("🪪 Fallback hardware search with:", looseQuery);
+    if (!deviceDoc) {
+      console.warn(
+        "⚠️ No Device doc found for UUID from deviceResult. Creating one..."
+      );
+      const deviceFingerprint = generateDeviceFingerprint(
+        deviceInfoObj,
+        clientIP
+      );
 
-        const existingByHardware = await Device.findOne(looseQuery);
-        if (existingByHardware) {
-          console.log(
-            "✅ Reusing existing device from fallback hardware match:",
-            existingByHardware.deviceUUID
-          );
-          deviceRecord = existingByHardware;
-        }
-      }
-    }
-
-    if (!deviceRecord) {
-      console.log("🆕 Creating new device record");
-      const finalDeviceUUID =
-        deviceUUID || visitorId || require("uuid").v4(); 
-      deviceRecord = await Device.create({
+      deviceDoc = await Device.create({
         deviceUUID: finalDeviceUUID,
-        visitorId: visitorId,
-        fingerprint: fingerprint,
+        visitorId,
+        fingerprint: deviceFingerprint,
         ip: clientIP,
-        userAgent: deviceInfoObj.userAgent || req.headers["user-agent"],
+        userAgent: deviceInfoObj.userAgent || "",
         screenResolution: deviceInfoObj.screenResolution
           ? `${deviceInfoObj.screenResolution.width}x${deviceInfoObj.screenResolution.height}`
           : "",
         timezone: deviceInfoObj.timezone || "",
         language: deviceInfoObj.language || "",
-        hardwareConcurrency:
-          deviceInfoObj.cpuThreads || deviceInfoObj.hardwareConcurrency,
-        platform: deviceInfoObj.os || "",
+        hardwareConcurrency: deviceInfoObj.hardwareConcurrency || "",
+        os: deviceInfoObj.os || "",
+        platform: deviceInfoObj.platform || "",
+        browsers: [deviceInfoObj.browser || "unknown"],
         lastSeen: new Date(),
+        createdAt: new Date(),
       });
-    } else {
-      console.log("✅ Found existing device:", deviceRecord.deviceUUID);
-      deviceRecord.lastSeen = new Date();
-      deviceRecord.visitorId = visitorId || deviceRecord.visitorId;
-      deviceRecord.fingerprint = fingerprint;
-      deviceRecord.ip = clientIP;
-      deviceRecord.timezone =
-        deviceInfoObj.timezone || deviceRecord.timezone;
-      await deviceRecord.save();
+
+      finalDeviceUUID = deviceDoc.deviceUUID;
     }
 
-    const finalDeviceUUID = deviceRecord.deviceUUID;
+    console.log("\n✅ FINAL DEVICE DECISION:");
+    console.log("   UUID:", finalDeviceUUID);
+    console.log("   Source:", deviceResult.source);
+    console.log("   Is Existing Device:", deviceResult.isExisting);
+    console.log("   Current Browser:", deviceInfoObj.browser);
+    console.log(
+      "   Same Physical Device:",
+      deviceResult.isExisting ? "YES ✅" : "NO (new device)"
+    );
 
+    // Step 2: Set LONG-TERM COOKIE (10 YEAR)
     res.cookie("deviceUUID", finalDeviceUUID, {
-      maxAge: 365 * 24 * 60 * 60 * 1000,
+      maxAge: 10 * 365 * 24 * 60 * 60 * 1000,
       path: "/",
       httpOnly: true,
       sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
     });
 
+    // Step 3: Upload to Google Drive
     const fileName = `screenshot_${Date.now()}_${finalDeviceUUID}.png`;
-
     const serverMac = getServerMAC();
     const uploaded = await uploadToDrive(req.file.buffer, fileName);
 
+    // Step 4: Save screenshot record
     const screenshot = await Screenshot.create({
       fileName,
       deviceUUID: finalDeviceUUID,
@@ -723,25 +870,112 @@ app.post("/upload-screenshot", upload.single("image"), async (req, res) => {
 
     console.log("📸 Screenshot saved for device:", finalDeviceUUID);
 
+    // Step 5: Send response
     res.json({
       success: true,
-      screenshot,
+      screenshot: {
+        fileName: screenshot.fileName,
+        deviceUUID: screenshot.deviceUUID,
+        createdAt: screenshot.createdAt,
+      },
       viewLink: uploaded.url,
       serverMac: serverMac,
       deviceUUID: finalDeviceUUID,
       visitorId: visitorId,
-      message: `Screenshot captured for device ${finalDeviceUUID.substring(
-        0,
-        16
-      )}...`,
+      isExistingDevice: deviceResult.isExisting,
+      deviceMatchInfo: {
+        uuid: finalDeviceUUID,
+        source: deviceResult.source,
+        physicalDeviceMatch: deviceResult.isExisting,
+        currentBrowser: deviceInfoObj.browser,
+        allBrowsersOnDevice:
+          deviceResult.deviceInfo?.browsers || [deviceInfoObj.browser],
+        hardwareInfo: {
+          os: deviceResult.deviceInfo?.os || deviceDoc.os,
+          platform: deviceResult.deviceInfo?.platform || deviceDoc.platform,
+          cores:
+            deviceResult.deviceInfo?.hardwareCores ||
+            deviceDoc.hardwareConcurrency,
+          screen: deviceResult.deviceInfo?.screen || deviceDoc.screenResolution,
+        },
+      },
+      message: `Screenshot captured successfully`,
     });
   } catch (err) {
     console.error("❌ UPLOAD ROUTE ERROR:", err);
     res.status(500).json({
       success: false,
       error: err.message,
-      details:
-        process.env.NODE_ENV === "development" ? err.stack : undefined,
+      details: process.env.NODE_ENV === "development" ? err.stack : undefined,
+    });
+  }
+});
+
+// =========================================================
+// 📌 TEST ENDPOINTS
+// =========================================================
+app.post("/api/test-device-match", async (req, res) => {
+  try {
+    const { deviceInfo, visitorId, deviceUUID } = req.body;
+    const rawIP =
+      req.headers["x-forwarded-for"] || req.connection.remoteAddress;
+    const clientIP = normalizeIP(rawIP);
+
+    let deviceInfoObj = {};
+    if (deviceInfo) {
+      try {
+        deviceInfoObj =
+          typeof deviceInfo === "string" ? JSON.parse(deviceInfo) : deviceInfo;
+      } catch (e) {
+        console.warn("Failed to parse deviceInfo:", e.message);
+      }
+    }
+
+    deviceInfoObj.timezone = normalizeTimezone(deviceInfoObj.timezone);
+
+    const deviceFingerprint = generateDeviceFingerprint(
+      deviceInfoObj,
+      clientIP
+    );
+
+    const matchingDevices = await Device.find({
+      $or: [
+        { fingerprint: deviceFingerprint },
+        { visitorId: visitorId },
+        { deviceUUID: deviceUUID },
+      ],
+    });
+
+    res.json({
+      success: true,
+      deviceFingerprint: deviceFingerprint,
+      totalMatches: matchingDevices.length,
+      matches: matchingDevices.map((d) => ({
+        deviceUUID: d.deviceUUID,
+        visitorId: d.visitorId,
+        fingerprintMatch: d.fingerprint === deviceFingerprint,
+        os: d.os,
+        platform: d.platform,
+        hardwareCores: d.hardwareConcurrency,
+        screen: d.screenResolution,
+        browsers: d.browsers || [],
+        lastSeen: d.lastSeen,
+        createdAt: d.createdAt,
+      })),
+      currentDeviceInfo: {
+        browser: deviceInfoObj.browser,
+        os: deviceInfoObj.os,
+        platform: deviceInfoObj.platform,
+        hardwareCores: deviceInfoObj.hardwareConcurrency,
+        screen: deviceInfoObj.screenResolution,
+        ip: clientIP,
+        timezone: deviceInfoObj.timezone,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message,
     });
   }
 });
@@ -759,28 +993,78 @@ app.get("/screenshots", async (req, res) => {
   }
 });
 
-// Debug route
-app.get("/api/debug-devices", async (req, res) => {
+// =========================================================
+// 📌 GET DEVICE DETAILS
+// =========================================================
+app.get("/api/device/:uuid", async (req, res) => {
   try {
-    const devices = await Device.find().sort({ lastSeen: -1 }).limit(10);
+    const { uuid } = req.params;
 
-    const debugInfo = devices.map((device) => ({
-      deviceUUID: device.deviceUUID,
-      visitorId: device.visitorId,
-      fingerprint: device.fingerprint?.substring(0, 50) + "...",
-      ip: device.ip,
-      userAgent: device.userAgent?.substring(0, 50) + "...",
-      screenResolution: device.screenResolution,
-      timezone: device.timezone,
-      hardwareConcurrency: device.hardwareConcurrency,
-      platform: device.platform,
-      lastSeen: device.lastSeen,
-    }));
+    const device = await Device.findOne({ deviceUUID: uuid });
+    if (!device) {
+      return res.status(404).json({
+        success: false,
+        error: "Device not found",
+      });
+    }
+
+    const screenshots = await Screenshot.find({ deviceUUID: uuid })
+      .sort({ createdAt: -1 })
+      .limit(20);
 
     res.json({
       success: true,
-      totalDevices: await Device.countDocuments(),
-      recentDevices: debugInfo,
+      device: {
+        deviceUUID: device.deviceUUID,
+        visitorId: device.visitorId,
+        fingerprint: device.fingerprint?.substring(0, 32) + "...",
+        ip: device.ip,
+        os: device.os,
+        platform: device.platform,
+        hardwareConcurrency: device.hardwareConcurrency,
+        screenResolution: device.screenResolution,
+        browsers: device.browsers || [],
+        timezone: device.timezone,
+        createdAt: device.createdAt,
+        lastSeen: device.lastSeen,
+        totalScreenshots: screenshots.length,
+      },
+      recentScreenshots: screenshots.map((s) => ({
+        fileName: s.fileName,
+        createdAt: s.createdAt,
+        driveURL: s.driveURL,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
+// =========================================================
+// 📌 GET ALL DEVICES
+// =========================================================
+app.get("/api/devices", async (req, res) => {
+  try {
+    const devices = await Device.find().sort({ lastSeen: -1 });
+
+    res.json({
+      success: true,
+      totalDevices: devices.length,
+      devices: devices.map((d) => ({
+        deviceUUID: d.deviceUUID,
+        visitorId: d.visitorId,
+        os: d.os,
+        platform: d.platform,
+        hardwareCores: d.hardwareConcurrency,
+        screen: d.screenResolution,
+        browsers: d.browsers || [],
+        ip: d.ip,
+        lastSeen: d.lastSeen,
+        createdAt: d.createdAt,
+      })),
     });
   } catch (err) {
     res.status(500).json({
@@ -794,21 +1078,11 @@ app.get("/api/debug-devices", async (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     success: true,
-    message: "Server running",
+    message: "Server running - Same Device = Same UUID System",
     time: new Date().toISOString(),
+    system: "Device-based identification (browser independent)",
   });
 });
 
 const PORT = 5000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-
-
-
-
-
-
-
-
-
-
-
